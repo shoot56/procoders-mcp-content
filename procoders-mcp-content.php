@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Procoders MCP Content
  * Description: Exposes post types, blocks, and fields to the WordPress MCP Adapter, with per-type access levels.
- * Version: 0.1.0
+ * Version: 0.1.1
  * Requires at least: 6.9
  * Requires PHP: 8.0
  * Author: Dmitry Shutko

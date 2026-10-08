@@ -19,22 +19,20 @@ if ( ! defined( 'ABSPATH' ) ) {
 final class Settings {
 
 	public static function register_page(): void {
-		add_options_page(
+		$hook = add_options_page(
 			__( 'Procoders MCP Content', 'procoders-mcp-content' ),
 			__( 'Procoders MCP Content', 'procoders-mcp-content' ),
 			'manage_options',
 			'procoders-mcp-content',
 			array( self::class, 'render_page' )
 		);
+
+		add_action( 'load-' . $hook, array( self::class, 'handle_save' ) );
 	}
 
 	public static function render_page(): void {
 		if ( ! current_user_can( 'manage_options' ) ) {
 			wp_die( esc_html__( 'You do not have permission to manage these settings.', 'procoders-mcp-content' ) );
-		}
-
-		if ( isset( $_SERVER['REQUEST_METHOD'] ) && 'POST' === $_SERVER['REQUEST_METHOD'] ) {
-			self::handle_save();
 		}
 
 		$settings = Access::settings();
@@ -161,7 +159,15 @@ final class Settings {
 		update_option( Access::OPTION, $clean, false );
 	}
 
-	private static function handle_save(): void {
+	public static function handle_save(): void {
+		if ( ! isset( $_SERVER['REQUEST_METHOD'] ) || 'POST' !== $_SERVER['REQUEST_METHOD'] ) {
+			return;
+		}
+
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( esc_html__( 'You do not have permission to manage these settings.', 'procoders-mcp-content' ) );
+		}
+
 		check_admin_referer( 'procoders_mcp_content_settings', 'procoders_mcp_content_nonce' );
 
 		$raw = isset( $_POST['procoders_mcp_content'] ) ? wp_unslash( $_POST['procoders_mcp_content'] ) : array(); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- sanitized in save().

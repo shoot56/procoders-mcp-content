@@ -103,10 +103,15 @@ final class Abilities {
 	 * @return array<string, mixed>
 	 */
 	public static function get_block_schema( array $input ): array {
-		$name = isset( $input['name'] ) ? sanitize_text_field( (string) $input['name'] ) : '';
+		$post_type = self::post_type_from( $input );
+		$name      = isset( $input['name'] ) ? sanitize_text_field( (string) $input['name'] ) : '';
 
 		if ( '' === $name || ! \WP_Block_Type_Registry::get_instance()->is_registered( $name ) ) {
 			throw new Content_Exception( 'Block is not registered.' );
+		}
+
+		if ( ! Access::block_allowed( $post_type, $name ) ) {
+			throw new Content_Exception( 'Block is not enabled for this post type.' );
 		}
 
 		return array(
@@ -136,7 +141,8 @@ final class Abilities {
 		$post_type = self::post_type_from( $input );
 		$per_page  = isset( $input['per_page'] ) ? (int) $input['per_page'] : 20;
 		$per_page  = max( 1, min( 100, $per_page ) );
-		$status    = isset( $input['status'] ) ? sanitize_key( (string) $input['status'] ) : 'any';
+		$status    = isset( $input['status'] ) && is_scalar( $input['status'] ) ? sanitize_key( (string) $input['status'] ) : 'any';
+		$search    = isset( $input['search'] ) && is_scalar( $input['search'] ) ? sanitize_text_field( (string) $input['search'] ) : '';
 
 		$query = new \WP_Query(
 			array(
@@ -145,7 +151,7 @@ final class Abilities {
 				'posts_per_page'         => $per_page,
 				'orderby'                => 'date',
 				'order'                  => 'DESC',
-				's'                      => isset( $input['search'] ) ? sanitize_text_field( (string) $input['search'] ) : '',
+				's'                      => $search,
 				'ignore_sticky_posts'    => true,
 				'no_found_rows'          => true,
 				'update_post_meta_cache' => false,
@@ -180,7 +186,7 @@ final class Abilities {
 	 */
 	public static function create_post( array $input ): array {
 		$post_type = self::post_type_from( $input );
-		$title     = isset( $input['title'] ) ? sanitize_text_field( (string) $input['title'] ) : '';
+		$title     = self::text_value( $input['title'] ?? null, 'Title' );
 
 		if ( '' === $title ) {
 			throw new Content_Exception( 'Title is required.' );
@@ -191,8 +197,8 @@ final class Abilities {
 				'post_type'    => $post_type,
 				'post_title'   => $title,
 				'post_status'  => self::resolve_status( $post_type, $input['status'] ?? 'draft', true ),
-				'post_excerpt' => isset( $input['excerpt'] ) ? sanitize_textarea_field( (string) $input['excerpt'] ) : '',
-				'post_name'    => isset( $input['slug'] ) ? sanitize_title( (string) $input['slug'] ) : '',
+				'post_excerpt' => isset( $input['excerpt'] ) ? self::text_value( $input['excerpt'], 'Excerpt', true ) : '',
+				'post_name'    => isset( $input['slug'] ) ? sanitize_title( self::text_value( $input['slug'], 'Slug' ) ) : '',
 				'post_content' => self::content_from_input( $input, $post_type ),
 			),
 			true
@@ -218,23 +224,32 @@ final class Abilities {
 	 * @return array<string, mixed>
 	 */
 	public static function update_post( array $input ): array {
-		$post      = self::post_from_input( $input );
+		$post = self::post_from_input( $input );
+
+		if ( ! self::status_is_writable( $post->post_status, $post->post_type ) ) {
+			throw new Content_Exception( 'This post cannot be edited at the current access level.' );
+		}
+
 		$post_data = array( 'ID' => $post->ID );
 
 		if ( isset( $input['title'] ) ) {
-			$post_data['post_title'] = sanitize_text_field( (string) $input['title'] );
+			$post_data['post_title'] = self::text_value( $input['title'], 'Title' );
 		}
 
 		if ( isset( $input['excerpt'] ) ) {
-			$post_data['post_excerpt'] = sanitize_textarea_field( (string) $input['excerpt'] );
+			$post_data['post_excerpt'] = self::text_value( $input['excerpt'], 'Excerpt', true );
 		}
 
 		if ( isset( $input['slug'] ) ) {
-			$post_data['post_name'] = sanitize_title( (string) $input['slug'] );
+			$post_data['post_name'] = sanitize_title( self::text_value( $input['slug'], 'Slug' ) );
 		}
 
 		if ( isset( $input['status'] ) ) {
 			$post_data['post_status'] = self::resolve_status( $post->post_type, $input['status'], false );
+
+			if ( 'trash' === $post_data['post_status'] && ! current_user_can( 'delete_post', $post->ID ) ) {
+				throw new Content_Exception( 'You cannot trash this post.' );
+			}
 		}
 
 		if ( array_key_exists( 'content', $input ) ) {
@@ -265,9 +280,13 @@ final class Abilities {
 	 * @return array{id: int, url: string, mime: string}
 	 */
 	public static function upload_media( array $input ): array {
-		$url   = isset( $input['url'] ) ? (string) $input['url'] : '';
-		$title = isset( $input['title'] ) ? sanitize_text_field( (string) $input['title'] ) : '';
-		$alt   = isset( $input['alt'] ) ? sanitize_text_field( (string) $input['alt'] ) : '';
+		if ( ! isset( $input['url'] ) || ! is_scalar( $input['url'] ) ) {
+			throw new Content_Exception( 'A file URL is required.' );
+		}
+
+		$url   = (string) $input['url'];
+		$title = isset( $input['title'] ) ? self::text_value( $input['title'], 'Title' ) : '';
+		$alt   = isset( $input['alt'] ) ? self::text_value( $input['alt'], 'Alt' ) : '';
 
 		if ( '' === $url ) {
 			throw new Content_Exception( 'A file URL is required.' );
@@ -302,7 +321,11 @@ final class Abilities {
 	/**
 	 * @param array<string, mixed> $input Ability input.
 	 */
-	private static function can_read_type_input( array $input ): bool {
+	private static function can_read_type_input( mixed $input ): bool {
+		if ( ! is_array( $input ) ) {
+			return false;
+		}
+
 		$post_type = isset( $input['post_type'] ) ? sanitize_key( (string) $input['post_type'] ) : '';
 
 		return self::user_can_read_type( $post_type );
@@ -311,13 +334,13 @@ final class Abilities {
 	/**
 	 * @param array<string, mixed> $input Ability input.
 	 */
-	private static function can_read_block_input( array $input ): bool {
-		$post_type = isset( $input['post_type'] ) ? sanitize_key( (string) $input['post_type'] ) : '';
-		$name      = isset( $input['name'] ) ? sanitize_text_field( (string) $input['name'] ) : '';
-
-		if ( '' === $post_type ) {
-			return self::can_discover();
+	private static function can_read_block_input( mixed $input ): bool {
+		if ( ! is_array( $input ) ) {
+			return false;
 		}
+
+		$post_type = isset( $input['post_type'] ) && is_scalar( $input['post_type'] ) ? sanitize_key( (string) $input['post_type'] ) : '';
+		$name      = isset( $input['name'] ) && is_scalar( $input['name'] ) ? sanitize_text_field( (string) $input['name'] ) : '';
 
 		return self::user_can_read_type( $post_type ) && Access::block_allowed( $post_type, $name );
 	}
@@ -325,7 +348,11 @@ final class Abilities {
 	/**
 	 * @param array<string, mixed> $input Ability input.
 	 */
-	private static function can_read_post_input( array $input ): bool {
+	private static function can_read_post_input( mixed $input ): bool {
+		if ( ! is_array( $input ) ) {
+			return false;
+		}
+
 		$post_id = isset( $input['post_id'] ) ? (int) $input['post_id'] : 0;
 		$post    = get_post( $post_id );
 
@@ -339,15 +366,19 @@ final class Abilities {
 	/**
 	 * @param array<string, mixed> $input Ability input.
 	 */
-	private static function can_create_input( array $input ): bool {
-		$post_type = isset( $input['post_type'] ) ? sanitize_key( (string) $input['post_type'] ) : '';
+	private static function can_create_input( mixed $input ): bool {
+		if ( ! is_array( $input ) ) {
+			return false;
+		}
+
+		$post_type = isset( $input['post_type'] ) && is_scalar( $input['post_type'] ) ? sanitize_key( (string) $input['post_type'] ) : '';
 		$object    = get_post_type_object( $post_type );
 
 		if ( ! $object || ! Access::allows( $post_type, 'draft' ) || ! current_user_can( $object->cap->create_posts ) ) {
 			return false;
 		}
 
-		$status = isset( $input['status'] ) ? sanitize_key( (string) $input['status'] ) : 'draft';
+		$status = isset( $input['status'] ) && is_scalar( $input['status'] ) ? sanitize_key( (string) $input['status'] ) : 'draft';
 
 		if ( in_array( $status, array( 'publish', 'future', 'private' ), true ) ) {
 			return Access::allows( $post_type, 'publish' ) && current_user_can( $object->cap->publish_posts );
@@ -359,7 +390,11 @@ final class Abilities {
 	/**
 	 * @param array<string, mixed> $input Ability input.
 	 */
-	private static function can_update_input( array $input ): bool {
+	private static function can_update_input( mixed $input ): bool {
+		if ( ! is_array( $input ) ) {
+			return false;
+		}
+
 		$post_id = isset( $input['post_id'] ) ? (int) $input['post_id'] : 0;
 		$post    = get_post( $post_id );
 
@@ -371,11 +406,15 @@ final class Abilities {
 			return false;
 		}
 
+		if ( ! self::status_is_writable( $post->post_status, $post->post_type ) ) {
+			return false;
+		}
+
 		if ( ! isset( $input['status'] ) ) {
 			return true;
 		}
 
-		$status = sanitize_key( (string) $input['status'] );
+		$status = is_scalar( $input['status'] ) ? sanitize_key( (string) $input['status'] ) : '';
 
 		if ( 'trash' === $status ) {
 			return Access::allows_trash( $post->post_type ) && current_user_can( 'delete_post', $post->ID );
@@ -482,6 +521,14 @@ final class Abilities {
 	 * @param mixed $status Requested status.
 	 */
 	private static function resolve_status( string $post_type, mixed $status, bool $is_create ): string {
+		if ( null === $status || '' === $status ) {
+			$status = 'draft';
+		}
+
+		if ( ! is_scalar( $status ) ) {
+			throw new Content_Exception( 'Unsupported post status.' );
+		}
+
 		$status = sanitize_key( (string) $status );
 
 		if ( '' === $status ) {
@@ -500,11 +547,48 @@ final class Abilities {
 			return $status;
 		}
 
-		if ( in_array( $status, array( 'publish', 'future', 'private' ), true ) && ! Access::allows( $post_type, 'publish' ) ) {
-			throw new Content_Exception( 'Publishing is turned off for this post type.' );
+		if ( ! Access::allows( $post_type, 'draft' ) ) {
+			throw new Content_Exception( 'Writing is turned off for this post type.' );
+		}
+
+		if ( in_array( $status, array( 'publish', 'future', 'private' ), true ) ) {
+			$object = get_post_type_object( $post_type );
+
+			if ( ! Access::allows( $post_type, 'publish' ) ) {
+				throw new Content_Exception( 'Publishing is turned off for this post type.' );
+			}
+
+			if ( ! $object || ! current_user_can( $object->cap->publish_posts ) ) {
+				throw new Content_Exception( 'You cannot publish this post type.' );
+			}
 		}
 
 		return $status;
+	}
+
+	/**
+	 * Draft access can change drafts only. Live statuses need the publish level.
+	 */
+	private static function status_is_writable( string $status, string $post_type ): bool {
+		if ( in_array( $status, array( 'draft', 'pending', 'auto-draft' ), true ) ) {
+			return Access::allows( $post_type, 'draft' );
+		}
+
+		if ( 'trash' === $status ) {
+			return Access::allows_trash( $post_type );
+		}
+
+		return Access::allows( $post_type, 'publish' );
+	}
+
+	private static function text_value( mixed $value, string $label, bool $textarea = false ): string {
+		if ( ! is_scalar( $value ) ) {
+			throw new Content_Exception( sprintf( '%s must be text.', $label ) );
+		}
+
+		$string = (string) $value;
+
+		return $textarea ? sanitize_textarea_field( $string ) : sanitize_text_field( $string );
 	}
 
 	/**
@@ -539,10 +623,9 @@ final class Abilities {
 
 			if ( 0 === $image_id ) {
 				delete_post_thumbnail( $post_id );
-			} elseif ( 'attachment' === get_post_type( $image_id ) ) {
-				set_post_thumbnail( $post_id, $image_id );
 			} else {
-				throw new Content_Exception( 'featured_image_id is not an attachment.' );
+				Content::assert_usable_media( $image_id, 'image' );
+				set_post_thumbnail( $post_id, $image_id );
 			}
 		}
 	}

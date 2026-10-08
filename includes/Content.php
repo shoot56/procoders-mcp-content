@@ -18,19 +18,26 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 final class Content {
 
+	private const MAX_BLOCKS = 200;
+
+	private const MAX_DEPTH = 8;
+
+	private const MAX_REPEATER_ROWS = 100;
+
 	/**
 	 * @param array<int, mixed> $blocks    Block tree from the ability input.
 	 * @param string            $post_type Post type the blocks will be saved on.
 	 */
 	public static function blocks_to_html( array $blocks, string $post_type ): string {
 		$parsed = array();
+		$count  = 0;
 
 		foreach ( $blocks as $block ) {
 			if ( ! is_array( $block ) ) {
 				throw new Content_Exception( 'Each block must be an object.' );
 			}
 
-			$parsed[] = self::to_parsed_block( $block, $post_type, null );
+			$parsed[] = self::to_parsed_block( $block, $post_type, null, 1, $count );
 		}
 
 		return serialize_blocks( $parsed );
@@ -216,9 +223,10 @@ final class Content {
 		}
 
 		$mime = (string) get_post_mime_type( $id );
-		$ok   = str_starts_with( $mime, 'image/' ) || str_starts_with( $mime, 'video/' ) || 'application/pdf' === $mime;
+		$file = (string) get_attached_file( $id );
+		$ext  = strtolower( (string) pathinfo( $file, PATHINFO_EXTENSION ) );
 
-		if ( ! $ok ) {
+		if ( ! self::mime_allowed( $mime, 'file' ) || self::extension_blocked( $ext ) ) {
 			wp_delete_attachment( $id, true );
 			throw new Content_Exception( 'Only images, videos, and PDFs can be uploaded.' );
 		}
@@ -238,8 +246,21 @@ final class Content {
 	 * @param array<string, mixed> $node   One block from the ability input.
 	 * @return array<string, mixed>
 	 */
-	private static function to_parsed_block( array $node, string $post_type, ?string $parent ): array {
-		$name = isset( $node['name'] ) ? sanitize_text_field( (string) $node['name'] ) : '';
+	private static function to_parsed_block( array $node, string $post_type, ?string $parent, int $depth, int &$count ): array {
+		++$count;
+
+		if ( $count > self::MAX_BLOCKS ) {
+			throw new Content_Exception( 'Too many blocks in one post.' );
+		}
+
+		if ( $depth > self::MAX_DEPTH ) {
+			throw new Content_Exception( 'Blocks are nested too deeply.' );
+		}
+		if ( ! isset( $node['name'] ) || ! is_scalar( $node['name'] ) ) {
+			throw new Content_Exception( 'A block is missing its name.' );
+		}
+
+		$name = sanitize_text_field( (string) $node['name'] );
 
 		if ( '' === $name ) {
 			throw new Content_Exception( 'A block is missing its name.' );
@@ -261,6 +282,10 @@ final class Content {
 			$inner_nodes = $node['inner_blocks'];
 		} elseif ( 'core/list' === $name && isset( $node['items'] ) && is_array( $node['items'] ) ) {
 			foreach ( $node['items'] as $item ) {
+				if ( ! is_scalar( $item ) ) {
+					throw new Content_Exception( 'List items must be text.' );
+				}
+
 				$inner_nodes[] = array(
 					'name' => 'core/list-item',
 					'text' => (string) $item,
@@ -275,7 +300,7 @@ final class Content {
 				throw new Content_Exception( sprintf( 'Inner blocks of "%s" must be objects.', $name ) );
 			}
 
-			$inner[] = self::to_parsed_block( $child, $post_type, $name );
+			$inner[] = self::to_parsed_block( $child, $post_type, $name, $depth + 1, $count );
 		}
 
 		if ( str_starts_with( $name, 'core/' ) ) {
@@ -327,10 +352,18 @@ final class Content {
 		$inner_content = array();
 
 		if ( isset( $node['html'] ) && is_string( $node['html'] ) && '' !== $node['html'] ) {
-			$html = wp_kses_post( $node['html'] );
+			$html = self::sanitized_html( $node['html'] );
 		}
 
-		$text = isset( $node['text'] ) ? (string) $node['text'] : '';
+		$text = '';
+
+		if ( isset( $node['text'] ) ) {
+			if ( ! is_scalar( $node['text'] ) ) {
+				throw new Content_Exception( 'Block text must be text.' );
+			}
+
+			$text = (string) $node['text'];
+		}
 
 		switch ( $name ) {
 			case 'core/paragraph':
@@ -369,7 +402,15 @@ final class Content {
 				break;
 
 			case 'core/quote':
-				$citation = isset( $node['citation'] ) ? esc_html( (string) $node['citation'] ) : '';
+				$citation = '';
+
+				if ( isset( $node['citation'] ) ) {
+					if ( ! is_scalar( $node['citation'] ) ) {
+						throw new Content_Exception( 'Quote citation must be text.' );
+					}
+
+					$citation = esc_html( (string) $node['citation'] );
+				}
 				if ( '' === $html ) {
 					$html = '<blockquote class="wp-block-quote"><p>' . esc_html( $text ) . '</p>';
 					if ( '' !== $citation ) {
@@ -381,9 +422,7 @@ final class Content {
 
 			case 'core/image':
 				$attachment_id = isset( $node['id'] ) ? absint( $node['id'] ) : 0;
-				if ( $attachment_id <= 0 || 'attachment' !== get_post_type( $attachment_id ) ) {
-					throw new Content_Exception( 'core/image needs an existing attachment id.' );
-				}
+				self::assert_usable_media( $attachment_id, 'image' );
 				$attrs['id']       = $attachment_id;
 				$attrs['sizeSlug'] = 'large';
 				$image             = wp_get_attachment_image( $attachment_id, 'large', false, array( 'class' => 'wp-image-' . $attachment_id ) );
@@ -405,7 +444,7 @@ final class Content {
 				break;
 
 			case 'core/button':
-				$url = isset( $node['url'] ) ? esc_url( (string) $node['url'] ) : '';
+				$url = isset( $node['url'] ) && is_scalar( $node['url'] ) ? esc_url( (string) $node['url'] ) : '';
 				if ( '' === $html ) {
 					$html = '<div class="wp-block-button"><a class="wp-block-button__link wp-element-button" href="' . $url . '">' . esc_html( $text ) . '</a></div>';
 				}
@@ -413,7 +452,7 @@ final class Content {
 
 			case 'core/html':
 				if ( '' === $html ) {
-					$html = wp_kses_post( $text );
+					$html = self::sanitized_html( $text );
 				}
 				break;
 
@@ -519,7 +558,12 @@ final class Content {
 		$key  = (string) $field['key'];
 
 		if ( 'repeater' === $type ) {
-			$rows         = is_array( $value ) ? array_values( $value ) : array();
+			$rows = is_array( $value ) ? array_values( $value ) : array();
+
+			if ( count( $rows ) > self::MAX_REPEATER_ROWS ) {
+				throw new Content_Exception( sprintf( 'Repeater "%s" has too many rows.', $field['name'] ) );
+			}
+
 			$data[ $name ] = count( $rows );
 			$data[ '_' . $name ] = $key;
 
@@ -556,24 +600,36 @@ final class Content {
 		}
 
 		if ( 'flexible_content' === $type ) {
-			$rows            = is_array( $value ) ? array_values( $value ) : array();
-			$data[ $name ]   = count( $rows );
+			$rows = is_array( $value ) ? array_values( $value ) : array();
+
+			if ( count( $rows ) > self::MAX_REPEATER_ROWS ) {
+				throw new Content_Exception( sprintf( 'Flexible content "%s" has too many rows.', $field['name'] ) );
+			}
+
+			$data[ $name ]       = count( $rows );
 			$data[ '_' . $name ] = $key;
 
 			foreach ( $rows as $index => $row ) {
-				if ( ! is_array( $row ) || empty( $row['acf_fc_layout'] ) ) {
+				if ( ! is_array( $row ) || ! isset( $row['acf_fc_layout'] ) || ! is_scalar( $row['acf_fc_layout'] ) ) {
 					throw new Content_Exception( sprintf( 'Flexible content "%s" needs acf_fc_layout on each row.', $field['name'] ) );
 				}
 
 				$layout_name = sanitize_key( (string) $row['acf_fc_layout'] );
-				$data[ $name . '_' . $index . '_acf_fc_layout' ] = $layout_name;
-				$subs = array();
+				$matched     = null;
 
 				foreach ( $field['layouts'] ?? array() as $layout ) {
-					if ( is_array( $layout ) && ( $layout['name'] ?? '' ) === $layout_name ) {
-						$subs = $layout['sub_fields'] ?? array();
+					if ( is_array( $layout ) && ( $layout['name'] ?? '' ) === $layout_name && '' !== $layout_name ) {
+						$matched = $layout;
+						break;
 					}
 				}
+
+				if ( ! is_array( $matched ) ) {
+					throw new Content_Exception( sprintf( 'Layout "%s" is not part of "%s".', $layout_name, $field['name'] ) );
+				}
+
+				$data[ $name . '_' . $index . '_acf_fc_layout' ] = $layout_name;
+				$subs = $matched['sub_fields'] ?? array();
 
 				foreach ( $subs as $sub ) {
 					if ( ! is_array( $sub ) || ! array_key_exists( $sub['name'], $row ) ) {
@@ -676,12 +732,35 @@ final class Content {
 			return '';
 		}
 
+		if ( is_object( $value ) ) {
+			throw new Content_Exception( sprintf( 'Field "%s" does not accept an object.', $field['name'] ) );
+		}
+
 		switch ( $type ) {
 			case 'textarea':
-				return sanitize_textarea_field( (string) $value );
-
 			case 'wysiwyg':
-				return wp_kses_post( (string) $value );
+			case 'email':
+			case 'url':
+			case 'oembed':
+				if ( ! is_scalar( $value ) ) {
+					throw new Content_Exception( sprintf( 'Field "%s" must be text.', $field['name'] ) );
+				}
+
+				$string = (string) $value;
+
+				if ( 'wysiwyg' === $type ) {
+					return self::sanitized_html( $string );
+				}
+
+				if ( 'email' === $type ) {
+					return sanitize_email( $string );
+				}
+
+				if ( 'url' === $type || 'oembed' === $type ) {
+					return esc_url_raw( $string );
+				}
+
+				return sanitize_textarea_field( $string );
 
 			case 'number':
 			case 'range':
@@ -693,77 +772,149 @@ final class Content {
 			case 'true_false':
 				return $value ? 1 : 0;
 
-			case 'email':
-				return sanitize_email( (string) $value );
-
-			case 'url':
-			case 'oembed':
-				return esc_url_raw( (string) $value );
-
 			case 'image':
+				return self::attachment_id( $value, (string) $field['name'], 'image' );
+
 			case 'file':
-				return self::attachment_id( $value, (string) $field['name'] );
+				return self::attachment_id( $value, (string) $field['name'], 'file' );
 
 			case 'gallery':
+				return self::id_list( $value, (string) $field['name'], 'image' );
+
 			case 'relationship':
-				return self::id_list( $value, (string) $field['name'] );
+				return self::id_list( $value, (string) $field['name'], 'post' );
 
 			case 'link':
 				if ( ! is_array( $value ) ) {
 					throw new Content_Exception( sprintf( 'Field "%s" must be a link object.', $field['name'] ) );
 				}
+				$target = isset( $value['target'] ) && is_scalar( $value['target'] ) ? sanitize_text_field( (string) $value['target'] ) : '';
+
+				if ( ! in_array( $target, array( '', '_blank', '_self' ), true ) ) {
+					$target = '';
+				}
+
+				$url   = isset( $value['url'] ) && is_scalar( $value['url'] ) ? (string) $value['url'] : '';
+				$title = isset( $value['title'] ) && is_scalar( $value['title'] ) ? (string) $value['title'] : '';
+
 				return array(
-					'url'    => esc_url_raw( (string) ( $value['url'] ?? '' ) ),
-					'title'  => sanitize_text_field( (string) ( $value['title'] ?? '' ) ),
-					'target' => sanitize_text_field( (string) ( $value['target'] ?? '' ) ),
+					'url'    => esc_url_raw( $url ),
+					'title'  => sanitize_text_field( $title ),
+					'target' => $target,
 				);
 
 			case 'checkbox':
 			case 'select':
 				if ( is_array( $value ) ) {
-					return array_map(
-						static function ( $item ): string {
-							return sanitize_text_field( (string) $item );
-						},
-						$value
-					);
+					$clean = array();
+
+					foreach ( $value as $item ) {
+						if ( ! is_scalar( $item ) ) {
+							throw new Content_Exception( sprintf( 'Field "%s" must be text.', $field['name'] ) );
+						}
+
+						$clean[] = sanitize_text_field( (string) $item );
+					}
+
+					return $clean;
 				}
+
+				if ( ! is_scalar( $value ) ) {
+					throw new Content_Exception( sprintf( 'Field "%s" must be text.', $field['name'] ) );
+				}
+
 				return sanitize_text_field( (string) $value );
 
 			default:
-				if ( is_array( $value ) ) {
+				if ( is_array( $value ) || ! is_scalar( $value ) ) {
 					throw new Content_Exception( sprintf( 'Field "%s" (%s) does not accept a list.', $field['name'], $type ) );
 				}
 				return sanitize_text_field( (string) $value );
 		}
 	}
 
-	private static function attachment_id( mixed $value, string $name ): int {
+	/**
+	 * Confirm an attachment can be embedded. SVG and HTML are rejected.
+	 */
+	public static function assert_usable_media( int $id, string $kind ): void {
+		self::attachment_id( $id, 'media', $kind );
+	}
+
+	private static function attachment_id( mixed $value, string $name, string $kind ): int {
 		if ( is_array( $value ) && isset( $value['id'] ) ) {
 			$value = $value['id'];
 		}
 
+		if ( is_array( $value ) || is_object( $value ) ) {
+			throw new Content_Exception( sprintf( 'Field "%s" needs an attachment ID.', $name ) );
+		}
+
 		$id = absint( $value );
 
-		if ( $id <= 0 || 'attachment' !== get_post_type( $id ) ) {
+		if ( $id <= 0 || 'attachment' !== get_post_type( $id ) || ! current_user_can( 'read_post', $id ) ) {
 			throw new Content_Exception( sprintf( 'Field "%s" needs an attachment ID.', $name ) );
+		}
+
+		$mime = (string) get_post_mime_type( $id );
+		$ext  = strtolower( (string) pathinfo( (string) get_attached_file( $id ), PATHINFO_EXTENSION ) );
+
+		if ( ! self::mime_allowed( $mime, $kind ) || self::extension_blocked( $ext ) ) {
+			throw new Content_Exception( sprintf( 'Field "%s" does not allow that file type.', $name ) );
 		}
 
 		return $id;
 	}
 
 	/**
+	 * Post HTML allowlist, including for administrators. MCP input must not keep scripts.
+	 */
+	private static function sanitized_html( string $html ): string {
+		return wp_kses( $html, wp_kses_allowed_html( 'post' ) );
+	}
+
+	private static function mime_allowed( string $mime, string $kind ): bool {
+		if ( '' === $mime || str_contains( $mime, 'svg' ) || in_array( $mime, array( 'text/html', 'application/xhtml+xml', 'application/xml', 'text/xml' ), true ) ) {
+			return false;
+		}
+
+		if ( 'image' === $kind ) {
+			return str_starts_with( $mime, 'image/' );
+		}
+
+		return str_starts_with( $mime, 'image/' ) || str_starts_with( $mime, 'video/' ) || 'application/pdf' === $mime;
+	}
+
+	private static function extension_blocked( string $ext ): bool {
+		return in_array( $ext, array( 'svg', 'svgz', 'html', 'htm', 'xhtml', 'php', 'phtml', 'phar', 'js', 'xml' ), true );
+	}
+
+	/**
 	 * @return array<int, int>
 	 */
-	private static function id_list( mixed $value, string $name ): array {
+	private static function id_list( mixed $value, string $name, string $kind ): array {
 		if ( ! is_array( $value ) ) {
 			throw new Content_Exception( sprintf( 'Field "%s" must be a list of IDs.', $name ) );
+		}
+
+		if ( count( $value ) > self::MAX_REPEATER_ROWS ) {
+			throw new Content_Exception( sprintf( 'Field "%s" has too many items.', $name ) );
 		}
 
 		$ids = array();
 
 		foreach ( $value as $item ) {
-			$ids[] = absint( is_array( $item ) ? ( $item['id'] ?? 0 ) : $item );
+			if ( 'post' === $kind ) {
+				$id = absint( is_array( $item ) ? ( $item['id'] ?? 0 ) : $item );
+
+				if ( $id <= 0 || ! get_post( $id ) || ! current_user_can( 'read_post', $id ) ) {
+					throw new Content_Exception( sprintf( 'Field "%s" contains a post you cannot read.', $name ) );
+				}
+
+				$ids[] = $id;
+				continue;
+			}
+
+			$ids[] = self::attachment_id( $item, $name, 'image' );
 		}
 
 		return $ids;
