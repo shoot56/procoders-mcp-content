@@ -18,7 +18,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 final class Content {
 
-	private const MAX_BLOCKS = 200;
+	private const MAX_BLOCKS = 400;
 
 	private const MAX_DEPTH = 8;
 
@@ -115,7 +115,7 @@ final class Content {
 	}
 
 	/**
-	 * @param array<string, mixed> $terms Taxonomy => list of IDs or slugs.
+	 * @param array<string, mixed> $terms Taxonomy => list of IDs, names, or {name, parent} objects.
 	 */
 	public static function assign_terms( int $post_id, string $post_type, array $terms, bool $create_missing ): void {
 		foreach ( $terms as $taxonomy => $raw_terms ) {
@@ -921,30 +921,64 @@ final class Content {
 	}
 
 	/**
-	 * @param mixed      $term Term ID or slug.
+	 * Resolve a term ID. A string is a name. An object may set name, slug, and parent.
+	 *
+	 * Parent is a name, slug, or numeric ID. On a hierarchical taxonomy the parent
+	 * is created when missing, and an existing term is moved under it.
+	 *
+	 * @param mixed        $term Term ID, name, or {name, slug, parent}.
 	 * @param \WP_Taxonomy $tax  Taxonomy object.
 	 */
 	private static function resolve_term( string $taxonomy, mixed $term, bool $create_missing, \WP_Taxonomy $tax ): int {
-		if ( is_int( $term ) || ( is_string( $term ) && ctype_digit( $term ) ) ) {
-			$found = get_term( (int) $term, $taxonomy );
+		$parent_id = 0;
 
-			if ( $found instanceof \WP_Term ) {
-				return (int) $found->term_id;
+		if ( is_array( $term ) ) {
+			if ( array_key_exists( 'parent', $term ) && null !== $term['parent'] && '' !== $term['parent'] ) {
+				if ( ! $tax->hierarchical ) {
+					throw new Content_Exception( sprintf( 'Taxonomy "%s" cannot have parent terms.', $taxonomy ) );
+				}
+
+				$parent_id = self::resolve_term( $taxonomy, $term['parent'], $create_missing, $tax );
 			}
 
-			throw new Content_Exception( sprintf( 'Term %s was not found in %s.', (string) $term, $taxonomy ) );
-		}
+			if ( isset( $term['id'] ) && ( is_int( $term['id'] ) || ( is_string( $term['id'] ) && ctype_digit( $term['id'] ) ) ) ) {
+				return self::term_with_parent( $taxonomy, (int) $term['id'], $parent_id, $tax );
+			}
 
-		$slug = sanitize_title( (string) $term );
+			$name = '';
+			$slug = '';
 
-		if ( '' === $slug ) {
-			throw new Content_Exception( sprintf( 'Empty term in %s.', $taxonomy ) );
+			if ( isset( $term['name'] ) && is_scalar( $term['name'] ) ) {
+				$name = sanitize_text_field( (string) $term['name'] );
+				$slug = sanitize_title( $name );
+			}
+
+			if ( isset( $term['slug'] ) && is_scalar( $term['slug'] ) && '' !== (string) $term['slug'] ) {
+				$slug = sanitize_title( (string) $term['slug'] );
+
+				if ( '' === $name ) {
+					$name = $slug;
+				}
+			}
+
+			if ( '' === $slug ) {
+				throw new Content_Exception( sprintf( 'Empty term in %s.', $taxonomy ) );
+			}
+		} elseif ( is_int( $term ) || ( is_string( $term ) && ctype_digit( $term ) ) ) {
+			return self::term_with_parent( $taxonomy, (int) $term, 0, $tax );
+		} else {
+			$name = sanitize_text_field( (string) $term );
+			$slug = sanitize_title( $name );
+
+			if ( '' === $slug ) {
+				throw new Content_Exception( sprintf( 'Empty term in %s.', $taxonomy ) );
+			}
 		}
 
 		$found = get_term_by( 'slug', $slug, $taxonomy );
 
 		if ( $found instanceof \WP_Term ) {
-			return (int) $found->term_id;
+			return self::maybe_set_parent( $found, $taxonomy, $parent_id, $tax );
 		}
 
 		if ( ! $create_missing ) {
@@ -955,12 +989,62 @@ final class Content {
 			throw new Content_Exception( sprintf( 'You cannot create %s terms.', $taxonomy ) );
 		}
 
-		$created = wp_insert_term( sanitize_text_field( (string) $term ), $taxonomy, array( 'slug' => $slug ) );
+		$args = array( 'slug' => $slug );
+
+		if ( $parent_id > 0 ) {
+			$args['parent'] = $parent_id;
+		}
+
+		$created = wp_insert_term( $name, $taxonomy, $args );
 
 		if ( is_wp_error( $created ) ) {
 			throw new Content_Exception( $created->get_error_message() );
 		}
 
 		return (int) $created['term_id'];
+	}
+
+	/**
+	 * Load a term by ID and apply a parent when one was requested.
+	 */
+	private static function term_with_parent( string $taxonomy, int $term_id, int $parent_id, \WP_Taxonomy $tax ): int {
+		$found = get_term( $term_id, $taxonomy );
+
+		if ( ! $found instanceof \WP_Term ) {
+			throw new Content_Exception( sprintf( 'Term %d was not found in %s.', $term_id, $taxonomy ) );
+		}
+
+		return self::maybe_set_parent( $found, $taxonomy, $parent_id, $tax );
+	}
+
+	/**
+	 * Move an existing term under a parent. A zero parent leaves the term where it is.
+	 */
+	private static function maybe_set_parent( \WP_Term $term, string $taxonomy, int $parent_id, \WP_Taxonomy $tax ): int {
+		if ( $parent_id <= 0 || (int) $term->parent === $parent_id ) {
+			return (int) $term->term_id;
+		}
+
+		if ( $parent_id === (int) $term->term_id ) {
+			throw new Content_Exception( sprintf( 'Term "%s" cannot be its own parent.', $term->name ) );
+		}
+
+		if ( ! current_user_can( $tax->cap->edit_terms ) ) {
+			throw new Content_Exception( sprintf( 'You cannot edit %s terms.', $taxonomy ) );
+		}
+
+		$updated = wp_update_term(
+			(int) $term->term_id,
+			$taxonomy,
+			array(
+				'parent' => $parent_id,
+			)
+		);
+
+		if ( is_wp_error( $updated ) ) {
+			throw new Content_Exception( $updated->get_error_message() );
+		}
+
+		return (int) $term->term_id;
 	}
 }

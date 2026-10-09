@@ -47,8 +47,8 @@ final class Abilities {
 		self::add( 'get-post-fields', __( 'Return ACF fields stored on a post type, outside blocks.', 'procoders-mcp-content' ), true, array( self::class, 'get_post_fields' ), self::can_read_type_input( ... ) );
 		self::add( 'list-posts', __( 'List posts of an enabled post type.', 'procoders-mcp-content' ), true, array( self::class, 'list_posts' ), self::can_read_type_input( ... ) );
 		self::add( 'get-post', __( 'Get one post, including structured blocks and fields.', 'procoders-mcp-content' ), true, array( self::class, 'get_post' ), self::can_read_post_input( ... ) );
-		self::add( 'create-post', __( 'Create a post. Content is a list of blocks with field values.', 'procoders-mcp-content' ), false, array( self::class, 'create_post' ), self::can_create_input( ... ) );
-		self::add( 'update-post', __( 'Update a post. Only provided fields, blocks, and terms change.', 'procoders-mcp-content' ), false, array( self::class, 'update_post' ), self::can_update_input( ... ) );
+		self::add( 'create-post', __( 'Create a post. Content is a list of blocks with field values. Author is a user ID, login, or email. Date is the original local datetime. A term may be an object with name and parent.', 'procoders-mcp-content' ), false, array( self::class, 'create_post' ), self::can_create_input( ... ) );
+		self::add( 'update-post', __( 'Update a post. Only provided fields, blocks, terms, author, and date change. A term may be an object with name and parent.', 'procoders-mcp-content' ), false, array( self::class, 'update_post' ), self::can_update_input( ... ) );
 		self::add( 'upload-media', __( 'Download a file from a URL into the media library.', 'procoders-mcp-content' ), false, array( self::class, 'upload_media' ), self::can_upload( ... ) );
 	}
 
@@ -193,13 +193,16 @@ final class Abilities {
 		}
 
 		$post_id = wp_insert_post(
-			array(
-				'post_type'    => $post_type,
-				'post_title'   => $title,
-				'post_status'  => self::resolve_status( $post_type, $input['status'] ?? 'draft', true ),
-				'post_excerpt' => isset( $input['excerpt'] ) ? self::text_value( $input['excerpt'], 'Excerpt', true ) : '',
-				'post_name'    => isset( $input['slug'] ) ? sanitize_title( self::text_value( $input['slug'], 'Slug' ) ) : '',
-				'post_content' => self::content_from_input( $input, $post_type ),
+			array_merge(
+				array(
+					'post_type'    => $post_type,
+					'post_title'   => $title,
+					'post_status'  => self::resolve_status( $post_type, $input['status'] ?? 'draft', true ),
+					'post_excerpt' => isset( $input['excerpt'] ) ? self::text_value( $input['excerpt'], 'Excerpt', true ) : '',
+					'post_name'    => isset( $input['slug'] ) ? sanitize_title( self::text_value( $input['slug'], 'Slug' ) ) : '',
+					'post_content' => self::content_from_input( $input, $post_type ),
+				),
+				self::authorship_from_input( $input, $post_type )
 			),
 			true
 		);
@@ -255,6 +258,8 @@ final class Abilities {
 		if ( array_key_exists( 'content', $input ) ) {
 			$post_data['post_content'] = self::content_from_input( $input, $post->post_type );
 		}
+
+		$post_data = array_merge( $post_data, self::authorship_from_input( $input, $post->post_type ) );
 
 		if ( count( $post_data ) > 1 ) {
 			$result = wp_update_post( $post_data, true );
@@ -579,6 +584,92 @@ final class Abilities {
 		}
 
 		return Access::allows( $post_type, 'publish' );
+	}
+
+	/**
+	 * Author and original publication date for create and update.
+	 *
+	 * Author accepts a user ID, login, or email. Date is local site time,
+	 * `Y-m-d H:i:s`. `date_gmt` overrides the computed GMT value.
+	 *
+	 * @param array<string, mixed> $input Ability input.
+	 * @return array<string, int|string>
+	 */
+	private static function authorship_from_input( array $input, string $post_type ): array {
+		$args   = array();
+		$author = self::author_id_from_input( $input, $post_type );
+
+		if ( null !== $author ) {
+			$args['post_author'] = $author;
+		}
+
+		if ( isset( $input['date'] ) ) {
+			$args['post_date'] = self::mysql_datetime( $input['date'], 'Date' );
+		}
+
+		if ( isset( $input['date_gmt'] ) ) {
+			$args['post_date_gmt'] = self::mysql_datetime( $input['date_gmt'], 'GMT date' );
+		} elseif ( isset( $args['post_date'] ) ) {
+			$args['post_date_gmt'] = get_gmt_from_date( $args['post_date'] );
+		}
+
+		return $args;
+	}
+
+	/**
+	 * @param array<string, mixed> $input Ability input.
+	 */
+	private static function author_id_from_input( array $input, string $post_type ): ?int {
+		if ( ! array_key_exists( 'author', $input ) || null === $input['author'] || '' === $input['author'] ) {
+			return null;
+		}
+
+		$author = $input['author'];
+		$user   = false;
+
+		if ( is_int( $author ) || ( is_string( $author ) && ctype_digit( $author ) ) ) {
+			$user = get_userdata( (int) $author );
+		} elseif ( is_string( $author ) ) {
+			$user = get_user_by( 'login', $author );
+
+			if ( ! $user && is_email( $author ) ) {
+				$user = get_user_by( 'email', $author );
+			}
+		}
+
+		if ( ! $user instanceof \WP_User ) {
+			throw new Content_Exception( 'Author was not found. Pass a user ID, login, or email.' );
+		}
+
+		$object = get_post_type_object( $post_type );
+		$cap    = $object ? $object->cap->edit_others_posts : 'edit_others_posts';
+
+		if ( (int) $user->ID !== get_current_user_id() && ! current_user_can( $cap ) ) {
+			throw new Content_Exception( 'You cannot assign posts to another author.' );
+		}
+
+		return (int) $user->ID;
+	}
+
+	private static function mysql_datetime( mixed $value, string $label ): string {
+		if ( ! is_scalar( $value ) ) {
+			throw new Content_Exception( sprintf( '%s must be text.', $label ) );
+		}
+
+		$raw = str_replace( 'T', ' ', trim( (string) $value ) );
+
+		if ( preg_match( '/^\d{4}-\d{2}-\d{2}$/', $raw ) ) {
+			$raw .= ' 00:00:00';
+		}
+
+		$raw  = substr( $raw, 0, 19 );
+		$date = \DateTimeImmutable::createFromFormat( '!Y-m-d H:i:s', $raw );
+
+		if ( ! $date || $date->format( 'Y-m-d H:i:s' ) !== $raw ) {
+			throw new Content_Exception( sprintf( '%s must be a date like 2024-01-15 12:00:00.', $label ) );
+		}
+
+		return $date->format( 'Y-m-d H:i:s' );
 	}
 
 	private static function text_value( mixed $value, string $label, bool $textarea = false ): string {
